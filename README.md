@@ -24,7 +24,7 @@ Track and log time to GitLab issues directly from Neovim. Start/stop a timer for
 
 ~~~lua
 {
-  "ceickhoff/gitlab-timer.nvim",
+  "eic-chr/gitlab-timer.nvim",
   dependencies = { "nvim-lua/plenary.nvim" },
   config = function()
     require("gitlab-timer").setup({
@@ -58,7 +58,7 @@ Track and log time to GitLab issues directly from Neovim. Start/stop a timer for
 
 ~~~lua
 use({
-  "ceickhoff/gitlab-timer.nvim",
+  "eic-chr/gitlab-timer.nvim",
   requires = { "nvim-lua/plenary.nvim" },
   config = function()
     require("gitlab-timer").setup({
