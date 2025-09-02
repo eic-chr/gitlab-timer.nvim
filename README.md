@@ -183,6 +183,17 @@ vim.keymap.set("n", "<leader>gS", function() require("gitlab-timer").stop_timer(
   - Set `gitlab_url` to your instance base URL (e.g., `https://gitlab.internal.tld`).
   - Ensure your token was created on that instance with the right scopes.
 
+## Testing
+
+- Neovim (internal smoke tests):
+  - Run :GitlabTimerRunTests inside Neovim. This executes lightweight checks for core helpers (duration parsing/formatting, URL extraction, token resolution) and reports results via notifications.
+
+- Busted (CLI) tests:
+  - Ensure Lua and busted are installed (e.g., via LuaRocks).
+  - From the repository root, run:
+    - busted tests
+  - Tests are located in tests/core_spec.lua and include minimal Neovim stubs to run outside Neovim.
+
 ## Security
 
 - Prefer `$GITLAB_TOKEN` over hardcoding tokens in your config.

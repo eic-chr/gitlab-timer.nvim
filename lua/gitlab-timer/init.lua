@@ -155,15 +155,26 @@ end
 
 -- === GITLAB API ===
 
+local function get_token()
+    -- Prefer environment variable if set and non-empty
+    if vim.env.GITLAB_TOKEN and vim.env.GITLAB_TOKEN ~= "" then
+        return vim.env.GITLAB_TOKEN
+    end
+    -- Fallback to config value if provided and non-empty
+    if config.gitlab_token and config.gitlab_token ~= "" then
+        return config.gitlab_token
+    end
+    return nil
+end
+
 local function get_gitlab_headers()
     return {
-        ["Private-Token"] = (vim.env.GITLAB_TOKEN ~= "" and vim.env.GITLAB_TOKEN) or
-        (config.gitlab_token ~= "" and config.gitlab_token or nil),
+        ["Private-Token"] = get_token(),
         ["Content-Type"] = "application/json",
     }
 end
 
-local function graphql_request(query, variables)
+local function graphql_request(query, variables, opts)
     local curl = require("plenary.curl")
     local url = config.gitlab_url .. "/api/graphql"
 
@@ -172,33 +183,45 @@ local function graphql_request(query, variables)
         variables = variables or {},
     }
 
-    debug_log("GraphQL Query", { query = query, variables = variables })
+    local retries = (opts and opts.retries) or 2
+    local attempts = retries + 1
+    local last_status, last_body
 
-    local response = curl.post(url, {
-        headers = get_gitlab_headers(),
-        body = vim.fn.json_encode(request_body),
-        timeout = 10000,
-    })
+    for i = 1, attempts do
+        debug_log("GraphQL Query", { query = query, variables = variables, attempt = i })
 
-    debug_log("Response", { status = response.status, body = response.body and response.body:sub(1, 200) })
+        local response = curl.post(url, {
+            headers = get_gitlab_headers(),
+            body = vim.fn.json_encode(request_body),
+            timeout = 10000,
+        })
 
-    if response.status < 200 or response.status >= 300 then
-        notify("GraphQL request failed: HTTP " .. response.status, vim.log.levels.ERROR)
-        return nil
+        last_status, last_body = response.status, response.body
+        debug_log("Response", { status = response.status, body = response.body and response.body:sub(1, 200) })
+
+        if response.status >= 200 and response.status < 300 then
+            local ok, data = pcall(vim.fn.json_decode, response.body or "{}")
+            if not ok or not data then
+                notify("Failed to parse GraphQL response", vim.log.levels.ERROR)
+                return nil
+            end
+
+            if data.errors then
+                notify("GraphQL Errors: " .. vim.inspect(data.errors), vim.log.levels.ERROR)
+                return nil
+            end
+
+            return data.data
+        end
+
+        if i < attempts then
+            -- brief backoff before retrying
+            vim.wait(200 * i)
+        end
     end
 
-    local ok, data = pcall(vim.fn.json_decode, response.body or "{}")
-    if not ok or not data then
-        notify("Failed to parse GraphQL response", vim.log.levels.ERROR)
-        return nil
-    end
-
-    if data.errors then
-        notify("GraphQL Errors: " .. vim.inspect(data.errors), vim.log.levels.ERROR)
-        return nil
-    end
-
-    return data.data
+    notify("GraphQL request failed: HTTP " .. tostring(last_status), vim.log.levels.ERROR)
+    return nil
 end
 
 -- === SUBGROUP MANAGEMENT ===
@@ -210,23 +233,34 @@ local function fetch_subgroups()
         return {}
     end
 
-    local group_path = group_id:gsub("%%2F", "/")
-
     -- Use REST API to get subgroups since GraphQL doesn't have direct subgroups field
     local curl = require("plenary.curl")
-    local url = config.gitlab_url .. "/api/v4/groups/" .. group_id:gsub("/", "%2F") .. "/subgroups"
+    local url = config.gitlab_url .. "/api/v4/groups/" .. group_id:gsub("/", "%2F") .. "/subgroups?per_page=100"
 
     debug_log("Fetching subgroups from: " .. url)
 
-    local response = curl.get(url, {
-        headers = get_gitlab_headers(),
-        timeout = 10000,
-    })
+    local response
+    local last_status
+    for i = 1, 3 do
+        response = curl.get(url, {
+            headers = get_gitlab_headers(),
+            timeout = 10000,
+        })
+        last_status = response.status
 
-    debug_log("Subgroups response", { status = response.status, body = response.body and response.body:sub(1, 200) })
+        debug_log("Subgroups response",
+            { attempt = i, status = response.status, body = response.body and response.body:sub(1, 200) })
 
-    if response.status < 200 or response.status >= 300 then
-        notify("Failed to fetch subgroups: HTTP " .. response.status, vim.log.levels.ERROR)
+        if response.status >= 200 and response.status < 300 then
+            break
+        end
+        if i < 3 then
+            vim.wait(200 * i)
+        end
+    end
+
+    if not response or last_status < 200 or last_status >= 300 then
+        notify("Failed to fetch subgroups: HTTP " .. tostring(last_status), vim.log.levels.ERROR)
         return {}
     end
 
@@ -249,8 +283,8 @@ function M.select_subgroup()
         local display_name = subgroup.name or subgroup.path or "Unknown"
         table.insert(options, string.format("📁 %s", display_name))
         -- Use full_path for the actual subgroup selection
-        subgroup_map[i + 1] = subgroup.full_path and subgroup.full_path:gsub("/", "%%2F") or
-        subgroup.path:gsub("/", "%%2F")
+        local __raw = subgroup.full_path or subgroup.path
+        subgroup_map[i + 1] = __raw and __raw:gsub("/", "%%2F") or nil
     end
 
     if #options == 1 then
@@ -746,6 +780,42 @@ function M.test_time_tracking()
     end)
 end
 
+-- Lightweight internal tests to verify core helpers. This is not a full test suite,
+-- but helps catch regressions quickly while developing locally.
+function M.run_tests()
+    local failures = {}
+
+    local function assert_eq(actual, expected, name)
+        if actual ~= expected then
+            table.insert(failures, string.format("%s: expected=%s got=%s", name, tostring(expected), tostring(actual)))
+        end
+    end
+
+    -- parse_duration_to_seconds
+    assert_eq(parse_duration_to_seconds("1h30m"), 5400, "parse_duration_to_seconds(1h30m)")
+    assert_eq(parse_duration_to_seconds("45m"), 2700, "parse_duration_to_seconds(45m)")
+    assert_eq(parse_duration_to_seconds("5"), 300, "parse_duration_to_seconds(5 default minutes)")
+
+    -- format_time
+    assert_eq(format_time(60), "1m", "format_time(60)")
+    assert_eq(format_time(3600), "1h", "format_time(3600)")
+    assert_eq(format_time(3660), "1h 1m", "format_time(3660) normalized display")
+
+    -- extract_project_from_url
+    assert_eq(extract_project_from_url("https://gitlab.com/group/project/-/issues/1"), "group/project",
+        "extract_project_from_url")
+
+    local msg
+    if #failures == 0 then
+        msg = "All tests passed"
+        notify(msg, vim.log.levels.INFO, "gitlab-timer tests")
+    else
+        msg = "Tests failed:\n- " .. table.concat(failures, "\n- ")
+        notify(msg, vim.log.levels.ERROR, "gitlab-timer tests")
+    end
+    return #failures == 0, failures
+end
+
 function M.debug_info()
     local token = config.gitlab_token or vim.env.GITLAB_TOKEN
 
@@ -842,6 +912,12 @@ function M.setup(opts)
     config = vim.tbl_deep_extend("force", config, opts or {})
     load_state()
 
+    -- Warn early if token is missing
+    local __token = get_token()
+    if not __token or __token == "" then
+        notify("GitLab token is not set. Export $GITLAB_TOKEN or set gitlab_token in setup().", vim.log.levels.WARN)
+    end
+
     if state.timer_start then
         start_timer_loop()
         notify("Resumed GitLab timer")
@@ -859,11 +935,23 @@ function M.setup(opts)
         GitlabTimerEntries = M.show_time_entries,
         GitlabTimerSubgroup = M.select_subgroup,
         GitlabTimerClearSubgroup = M.clear_subgroup,
+        GitlabTimerRunTests = M.run_tests,
     }
 
     for cmd, func in pairs(commands) do
         vim.api.nvim_create_user_command(cmd, func, {})
     end
 end
+
+-- Expose a few helpers for testing and advanced usage
+M._internal = {
+    format_time = format_time,
+    parse_duration_to_seconds = parse_duration_to_seconds,
+    detect_project_id = detect_project_id,
+    detect_group_id = detect_group_id,
+    extract_project_from_url = extract_project_from_url,
+    create_project_lookup = create_project_lookup,
+    get_token = get_token,
+}
 
 return M
